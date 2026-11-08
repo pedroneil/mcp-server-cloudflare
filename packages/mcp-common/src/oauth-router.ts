@@ -93,6 +93,7 @@ export function createCloudflareOAuthRouter<Env extends CloudflareOAuthEnv>({
 				clientRegistrationEndpoint: '/register',
 				accessTokenTTL: 3600,
 				refreshTokenTTL: 2_592_000,
+				refreshTokenIdleTTL: 2_592_000,
 				...provider,
 				apiRoute: MCP_ROUTE,
 				apiHandler,
