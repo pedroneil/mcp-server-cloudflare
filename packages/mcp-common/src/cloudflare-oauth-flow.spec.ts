@@ -320,3 +320,126 @@ describe('grants made before the move to /mcp', () => {
 		}
 	)
 })
+
+describe('createCloudflareOAuthRouter OAuth lifecycle', () => {
+	const router = createCloudflareOAuthRouter<CloudflareOAuthEnv>({
+		apiHandler: { fetch: () => new Response('ok') },
+		scopes: SCOPES,
+		metrics,
+		mcpRequestPolicy: {
+			allowedHostnames: ['mcp.example.com'],
+			allowedOriginHostnames: ['mcp.example.com'],
+		},
+	})
+	const routerEnv = {
+		...authEnv,
+		DEV_CLOUDFLARE_API_TOKEN: '',
+		DEV_CLOUDFLARE_EMAIL: '',
+		DEV_DISABLE_OAUTH: 'false',
+	} as unknown as CloudflareOAuthEnv
+
+	it('slides grant expiry on refresh and renews active DCR client registrations past 30 and 90 days', async () => {
+		mockCloudflare()
+
+		const registered = await router.fetch(
+			new Request(`${ORIGIN}/register`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					redirect_uris: [CLIENT_REDIRECT],
+					token_endpoint_auth_method: 'none',
+					client_name: 'VS Code MCP Client',
+				}),
+			}),
+			routerEnv,
+			executionCtx
+		)
+		expect(registered.status).toBe(201)
+		const { client_id: clientId } = await registered.json<{ client_id: string }>()
+
+		const verifier = 'client-verifier-'.repeat(4)
+		const authUrl = new URL(`${ORIGIN}/oauth/authorize`)
+		authUrl.searchParams.set('response_type', 'code')
+		authUrl.searchParams.set('client_id', clientId)
+		authUrl.searchParams.set('redirect_uri', CLIENT_REDIRECT)
+		authUrl.searchParams.set('state', 'client-state')
+		authUrl.searchParams.set('code_challenge', await s256(verifier))
+		authUrl.searchParams.set('code_challenge_method', 'S256')
+		authUrl.searchParams.set('resource', RESOURCE)
+
+		const authRequest = await helpers.parseAuthRequest(new Request(authUrl))
+		const { redirectTo } = await helpers.completeAuthorization({
+			request: authRequest,
+			userId: 'user-1',
+			metadata: {},
+			scope: authRequest.scope,
+			props: {
+				type: 'user_token',
+				accessToken: 'cf-access-initial',
+				refreshToken: 'cf-refresh-initial',
+				user: { id: 'user-1', email: 'user@example.com' },
+				accounts: [{ id: 'account-1', name: 'Account One' }],
+			},
+		})
+
+		const token = (body: Record<string, string>) =>
+			router.fetch(
+				new Request(`${ORIGIN}/token`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+					body: new URLSearchParams(body),
+				}),
+				routerEnv,
+				executionCtx
+			)
+
+		const issued = await token({
+			grant_type: 'authorization_code',
+			code: new URL(redirectTo).searchParams.get('code') ?? '',
+			redirect_uri: CLIENT_REDIRECT,
+			code_verifier: verifier,
+			client_id: clientId,
+			resource: RESOURCE,
+		})
+		expect(issued.status).toBe(200)
+		const { refresh_token: firstRefreshToken } = await issued.json<{ refresh_token: string }>()
+
+		const [userId, grantId] = firstRefreshToken.split(':')
+		const grantKey = `grant:${userId}:${grantId}`
+		const clientKey = `client:${clientId}`
+
+		const initialGrant = await kv.get<{ expiresAt: number }>(grantKey, 'json')
+		const initialClient = await kv.get<{ registrationExpiresAt: number }>(clientKey, 'json')
+		expect(initialGrant?.expiresAt).toBeDefined()
+		expect(initialClient?.registrationExpiresAt).toBeDefined()
+
+		// Simulate 20 days elapsed: the grant has 10 days left, and the DCR client has 40 days left
+		// (past half of its 90-day clientRegistrationTTL, so renewal is due on the next refresh).
+		const now = Math.floor(Date.now() / 1000)
+		const agedGrantExpiry = now + 10 * 24 * 60 * 60
+		const agedClientExpiry = now + 40 * 24 * 60 * 60
+		await kv.put(grantKey, JSON.stringify({ ...initialGrant, expiresAt: agedGrantExpiry }))
+		await kv.put(
+			clientKey,
+			JSON.stringify({ ...initialClient, registrationExpiresAt: agedClientExpiry })
+		)
+
+		const refreshed = await token({
+			grant_type: 'refresh_token',
+			refresh_token: firstRefreshToken,
+			client_id: clientId,
+			resource: RESOURCE,
+		})
+		expect(refreshed.status).toBe(200)
+
+		const updatedGrant = await kv.get<{ expiresAt: number }>(grantKey, 'json')
+		const updatedClient = await kv.get<{ registrationExpiresAt: number }>(clientKey, 'json')
+
+		// Grant expiry slid forward to ~30 days from now instead of staying capped at the initial 30-day cliff.
+		expect(updatedGrant!.expiresAt).toBeGreaterThanOrEqual(now + 30 * 24 * 60 * 60 - 10)
+		// Active DCR client registration renewed back to ~90 days from now so it never expires while in use.
+		expect(updatedClient!.registrationExpiresAt).toBeGreaterThanOrEqual(
+			now + 90 * 24 * 60 * 60 - 10
+		)
+	})
+})
